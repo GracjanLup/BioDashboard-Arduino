@@ -1,13 +1,15 @@
-"""Qt serial worker for Arduino communication."""
-
 from __future__ import annotations
 
 from threading import Lock
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QObject, QThread, Signal
 
-from app.serial.parser import has_supported_field, parse_serial_message
-from app.serial.protocol import SUPPORTED_COMMANDS
+from app.serial.parser import (
+    has_supported_field,
+    parse_serial_message,
+    validation_error_for_line,
+)
+from app.serial.protocol import SERIAL_BAUD_RATE, SUPPORTED_COMMANDS
 
 try:
     import serial
@@ -18,34 +20,35 @@ except ImportError:  # pragma: no cover - exercised only without pyserial instal
 
 
 def available_ports() -> list[str]:
-    """Return currently visible serial ports."""
-
     if list_ports is None:
         return []
     return [port.device for port in list_ports.comports()]
 
 
 class ArduinoSerialWorker(QThread):
-    """Background serial reader that emits parsed Arduino samples."""
-
     connected = Signal(str)
     disconnected = Signal()
     raw_received = Signal(str)
     sample_received = Signal(object, str)
     error = Signal(str)
 
-    def __init__(self, port: str, baud_rate: int = 115200, timeout: float = 1.0) -> None:
-        super().__init__()
+    def __init__(
+        self,
+        port: str,
+        baud_rate: int = SERIAL_BAUD_RATE,
+        timeout: float = 1.0,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
         self.port = port
         self.baud_rate = baud_rate
         self.timeout = timeout
         self._serial = None
         self._running = False
         self._lock = Lock()
+        self._last_validation_error: str | None = None
 
     def run(self) -> None:
-        """Open the serial port and continuously read line-based messages."""
-
         if serial is None:
             self.error.emit("pyserial is not installed.")
             self.disconnected.emit()
@@ -74,10 +77,14 @@ class ArduinoSerialWorker(QThread):
         self.connected.emit(self.port)
 
         while self._running:
+            serial_port = self._serial
+            if serial_port is None:
+                break
             try:
-                raw_bytes = self._serial.readline()
+                raw_bytes = serial_port.readline()
             except serial.SerialException as exc:
-                self.error.emit(f"Serial read error: {exc}")
+                if self._running:
+                    self.error.emit(f"Serial read error: {exc}")
                 break
 
             if not raw_bytes:
@@ -88,24 +95,34 @@ class ArduinoSerialWorker(QThread):
                 continue
 
             self.raw_received.emit(line)
+            validation_error = validation_error_for_line(line)
+            if validation_error is not None:
+                if validation_error != self._last_validation_error:
+                    self.error.emit(
+                        f"Ignored invalid measurement field: {validation_error} Raw data: {line}"
+                    )
+                    self._last_validation_error = validation_error
+
             parsed = parse_serial_message(line)
             if parsed is not None:
+                if validation_error is None:
+                    self._last_validation_error = None
                 self.sample_received.emit(parsed, line)
-            elif has_supported_field(line):
-                self.error.emit(f"Ignored malformed serial message: {line}")
+            elif has_supported_field(line) and validation_error is None:
+                reason = "supported fields are malformed."
+                if reason != self._last_validation_error:
+                    self.error.emit(f"Ignored invalid measurement: {reason} Raw data: {line}")
+                    self._last_validation_error = reason
 
+        self._running = False
         self._close_serial()
         self.disconnected.emit()
 
     def stop(self) -> None:
-        """Ask the serial loop to stop and close the port."""
-
         self._running = False
         self._close_serial()
 
     def send_command(self, command: str) -> bool:
-        """Send an Arduino command. Returns false when sending is not possible."""
-
         normalized = command.strip().upper()
         if normalized not in SUPPORTED_COMMANDS:
             self.error.emit(f"Unsupported Arduino command: {command}")

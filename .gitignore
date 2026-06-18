@@ -16,5 +16,9 @@ __pycache__/
 *.csv
 *.html
 
+# Local documentation and working prompt
+/Dokumentacja*
+/prompt.txt
+
 .DS_Store
 Thumbs.db

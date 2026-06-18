@@ -1,22 +1,21 @@
 # BioMonitor Dashboard
 
-BioMonitor Dashboard is a PySide6 desktop application for an educational Arduino Uno physiological monitoring system. It reads serial messages from the Arduino, parses temperature, heart-rate, and GSR data, calculates baseline-relative deltas, and visualizes everything in real time.
+BioMonitor Dashboard is a PySide6 desktop application for an educational Arduino Uno physiological monitoring system. It runs separate temperature, heart-rate/SpO2, and GSR tests, validates serial data, stores final results locally, and presents the complete measurement history.
 
 ## Features
 
 - Modern dark medical dashboard UI
 - Serial connection controls for Arduino Uno
-- Commands: `TEMP`, `GSR`, `BPM`, `ALL`, `STOP`
-- MAX30102 heart-rate, SpO2, pulse-validity, and GSR parsing
-- Robust parser for single and combined serial messages
-- Real-time pyqtgraph charts with timestamp axes
-- Last 5 minutes of live chart history by default
-- Baseline calibration workflow
-- Physiological status mapping based on baseline-relative sensor deviations
+- Commands: `TEMP`, `GSR`, `BPM`, `STOP`
+- Separate timed tests with instructions and progress
+- MAX30102 heart-rate, SpO2, and pulse-validity parsing
+- Actionable Event Log messages for invalid measurements
+- Locked pyqtgraph charts that show the complete stored history
+- Fixed-size sample markers independent of chart zoom
 - Persistent SQLite session storage
-- CSV export with `timestamp`, `temperature`, `heart_rate`, `spo2`, `pulse_valid`, `pulse_temperature`, `gsr`, `status`
-- HTML session report export
-- Settings page for COM port, baud rate, sampling interval, theme, chart history, and data folder
+- CSV export including `bioscore` and status
+- Medical Dark and High Contrast Dark themes
+- Settings page for COM port, theme, and data folder
 
 ## Arduino Message Format
 
@@ -30,15 +29,7 @@ GSR:542
 BPM:74,SPO2:97,PULSE_VALID:1,PULSE_TEMP:31.50
 ```
 
-Supported combined message:
-
-```text
-BPM:74,SPO2:97,PULSE_VALID:1,TEMP:35.82,GSR:542,PULSE_TEMP:31.50
-```
-
-Malformed fields are ignored. A line is accepted when at least one supported field is valid.
-When `PULSE_VALID:0`, the dashboard ignores the BPM value but still accepts other fields, such as `GSR`.
-See `PROTOCOL.md` for the full protocol.
+Malformed fields are rejected with a reason in the Event Log. When `PULSE_VALID:0`, the sample is not included in the final heart-rate result.
 
 ## Setup
 
@@ -52,11 +43,21 @@ python -m pip install -r requirements.txt
 python run.py
 ```
 
+Run the automated checks:
+
+```powershell
+python -m pip install -e .[dev]
+python -m unittest discover -s tests -v
+python -m ruff check app tests run.py
+python -m ruff format --check app tests run.py
+```
+
 ## Project Structure
 
 ```text
 app/
   main.py
+  measurements.py
   models.py
   bioscore/
   charts/
@@ -67,5 +68,4 @@ app/
     widgets/
 ```
 
-The application separates serial communication, parsing, scoring, persistence, charting, and GUI code so new sensors or Arduino commands can be added without coupling them to the main window.
-Samples are saved in `biomonitor.sqlite3` inside the configured data folder, so history remains available after closing and reopening the app.
+The application separates measurement rules, serial communication, parsing, scoring, persistence, charting, and GUI code. One final result is stored for each completed test in `biomonitor.sqlite3`, so history remains available after restarting the app.

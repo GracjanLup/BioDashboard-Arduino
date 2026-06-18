@@ -1,5 +1,3 @@
-"""Shared data models used by the BioMonitor Dashboard."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -14,24 +12,14 @@ STATUS_AROUSED = "AROUSED"
 
 @dataclass(slots=True)
 class BaselineValues:
-    """Average resting values used as the reference for deltas and BioScore."""
-
     temperature: float | None = None
     heart_rate: float | None = None
     gsr: float | None = None
     calibrated_at: datetime | None = None
 
-    @property
-    def is_complete(self) -> bool:
-        """Return true when every supported sensor has a baseline value."""
-
-        return self.temperature is not None and self.heart_rate is not None and self.gsr is not None
-
 
 @dataclass(slots=True)
 class SensorSample:
-    """Single timestamped physiological sample stored for the current session."""
-
     timestamp: datetime
     temperature: float | None = None
     heart_rate: float | None = None
@@ -43,8 +31,6 @@ class SensorSample:
     status: str = STATUS_NORMAL
 
     def to_record(self) -> dict[str, Any]:
-        """Convert the sample to a flat dictionary suitable for pandas export."""
-
         return {
             "timestamp": self.timestamp.isoformat(timespec="milliseconds"),
             "temperature": self.temperature,
@@ -60,8 +46,6 @@ class SensorSample:
 
 @dataclass(slots=True)
 class SensorDeltas:
-    """Differences between the current sample and calibrated baseline values."""
-
     temperature: float | None = None
     heart_rate: float | None = None
     gsr: float | None = None

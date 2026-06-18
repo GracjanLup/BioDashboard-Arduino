@@ -1,12 +1,12 @@
-"""Main window for BioMonitor Dashboard."""
-
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QTimer, Qt, Slot
+from PySide6.QtCore import QTimer, Qt, Slot
 from PySide6.QtWidgets import (
+    QApplication,
     QButtonGroup,
     QComboBox,
     QFileDialog,
@@ -22,7 +22,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QSpinBox,
     QStackedWidget,
     QTableView,
     QVBoxLayout,
@@ -31,118 +30,75 @@ from PySide6.QtWidgets import (
 
 from app.bioscore import BioScoreCalculator, status_for_score
 from app.charts import RealtimeChartWidget
-from app.models import STATUS_AROUSED, STATUS_NORMAL, STATUS_RELAX, SensorDeltas, SensorSample
+from app.measurements import (
+    MEASUREMENT_SPECS,
+    final_test_value,
+    format_test_value,
+    gsr_assessment_detail,
+    gsr_assessment_label,
+    heart_status,
+    invalid_measurement_reason,
+    is_measurement_command,
+    line_matches_command,
+    measurement_name,
+    measurement_spec,
+    numeric_value_from_raw_line,
+    spo2_status,
+    temperature_status,
+    value_for_command,
+)
+from app.models import STATUS_NORMAL, SensorSample
 from app.serial.arduino_serial import ArduinoSerialWorker, available_ports
 from app.serial.parser import ParsedMessage
-from app.serial.protocol import ArduinoCommand
+from app.serial.protocol import SERIAL_BAUD_RATE, ArduinoCommand
 from app.settings import AppSettings, SettingsManager
 from app.storage import SessionStore, timestamped_path
 from app.ui.theme import (
-    COLOR_MUTED,
-    COLOR_SUCCESS,
+    THEME_HIGH_CONTRAST_DARK,
+    THEME_MEDICAL_DARK,
+    apply_theme,
     color_for_status,
 )
+from app.ui.sample_table_model import SampleTableModel
 from app.ui.widgets import EventLog, MetricCard, StatusIndicator
 
 
-class SampleTableModel(QAbstractTableModel):
-    """Qt table model for session samples."""
-
-    HEADERS = [
-        "Timestamp",
-        "Temp \N{DEGREE SIGN}C",
-        "BPM",
-        "SpO2 %",
-        "Pulse OK",
-        "GSR",
-        "Status",
-    ]
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._samples: list[SensorSample] = []
-
-    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
-        return 0 if parent.isValid() else len(self._samples)
-
-    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
-        return 0 if parent.isValid() else len(self.HEADERS)
-
-    def data(self, index: QModelIndex, role: int = Qt.DisplayRole):
-        if not index.isValid() or role not in (Qt.DisplayRole, Qt.TextAlignmentRole):
-            return None
-
-        if role == Qt.TextAlignmentRole:
-            return Qt.AlignCenter
-
-        sample = self._samples[index.row()]
-        column = index.column()
-        if column == 0:
-            return sample.timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        if column == 1:
-            return _format_number(sample.temperature, 1)
-        if column == 2:
-            return _format_number(sample.heart_rate, 0)
-        if column == 3:
-            return _format_number(sample.spo2, 0)
-        if column == 4:
-            return _format_bool(sample.pulse_valid)
-        if column == 5:
-            return _format_number(sample.gsr, 0)
-        if column == 6:
-            return sample.status
-        return None
-
-    def headerData(  # noqa: N802
-        self,
-        section: int,
-        orientation: Qt.Orientation,
-        role: int = Qt.DisplayRole,
-    ):
-        if role != Qt.DisplayRole or orientation != Qt.Horizontal:
-            return None
-        return self.HEADERS[section]
-
-    def set_samples(self, samples: list[SensorSample]) -> None:
-        """Replace table contents."""
-
-        self.beginResetModel()
-        self._samples = samples
-        self.endResetModel()
+BIOMONITOR_VIEW = "BIOMONITOR"
 
 
 class MainWindow(QMainWindow):
-    """Main BioMonitor Dashboard window."""
-
-    def __init__(self) -> None:
+    def __init__(self, settings_manager: SettingsManager | None = None) -> None:
         super().__init__()
         self.setWindowTitle("BioMonitor Dashboard")
         self.resize(1480, 920)
 
-        self.settings_manager = SettingsManager()
+        self.settings_manager = settings_manager or SettingsManager()
         self.settings = self.settings_manager.load()
-        if self.settings.baud_rate == 9600:
-            self.settings.baud_rate = 115200
-        self.session_store = SessionStore(self.settings.data_folder / "biomonitor.sqlite3")
+        app = QApplication.instance()
+        if isinstance(app, QApplication):
+            apply_theme(app, self.settings.theme)
+        storage_warning = ""
+        try:
+            self.session_store = SessionStore(self.settings.data_folder / "biomonitor.sqlite3")
+        except (OSError, sqlite3.Error) as exc:
+            fallback_folder = AppSettings().data_folder
+            self.settings.data_folder = fallback_folder
+            self.session_store = SessionStore(fallback_folder / "biomonitor.sqlite3")
+            storage_warning = (
+                f"Could not open the configured data folder. Using {fallback_folder}. Reason: {exc}"
+            )
         self.score_calculator = BioScoreCalculator()
 
         self.serial_worker: ArduinoSerialWorker | None = None
-        self.latest_temperature: float | None = None
-        self.latest_heart_rate: float | None = None
-        self.latest_spo2: float | None = None
-        self.latest_pulse_valid: bool | None = None
-        self.latest_pulse_temperature: float | None = None
-        self.latest_gsr: float | None = None
-        self.current_mode = ArduinoCommand.STOP.value
-        self.selected_command = ArduinoCommand.ALL.value
-        self.selected_page_title = "Full BioMonitor"
-        self.last_status = STATUS_NORMAL
+        self.latest_readings = SensorSample(timestamp=datetime.now())
+        self.selected_command = BIOMONITOR_VIEW
         self.current_test_sample_count = 0
         self.last_raw_line = "No serial data received yet."
         self.active_test_command: str | None = None
         self.active_test_started_at: datetime | None = None
         self.active_test_duration_seconds = 0
         self.active_test_values: list[float] = []
+        self._invalid_reason_by_command: dict[str, str] = {}
 
         self.test_timer = QTimer(self)
         self.test_timer.setInterval(1000)
@@ -159,6 +115,8 @@ class MainWindow(QMainWindow):
         self.event_log.append_event(
             f"Application ready. Loaded {len(self.session_store.samples)} saved samples."
         )
+        if storage_warning:
+            self.event_log.append_event(storage_warning, "ERROR")
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         self._disconnect_serial()
@@ -213,13 +171,9 @@ class MainWindow(QMainWindow):
         self.disconnect_button = QPushButton("Disconnect")
         self.disconnect_button.clicked.connect(self._disconnect_serial)
 
-        self.connection_indicator = StatusIndicator("OFFLINE", COLOR_MUTED)
+        self.connection_indicator = StatusIndicator("OFFLINE")
         self.mode_indicator = QLabel("Mode: STOP")
-        self.mode_indicator.setObjectName("MutedLabel")
-        self.mode_indicator.setStyleSheet(
-            "padding: 6px 10px; border-radius: 7px; background: #111821; "
-            "border: 1px solid #263341;"
-        )
+        self.mode_indicator.setObjectName("ModeIndicator")
 
         layout = QHBoxLayout(top_bar)
         layout.setContentsMargins(22, 0, 22, 0)
@@ -249,33 +203,18 @@ class MainWindow(QMainWindow):
         self.sidebar_group.setExclusive(True)
 
         buttons = [
+            ("BioMonitor", lambda: self._select_live_mode(BIOMONITOR_VIEW)),
             (
-                "Full BioMonitor",
-                lambda: self._select_live_mode(
-                    ArduinoCommand.ALL.value,
-                    "Full BioMonitor",
-                ),
+                MEASUREMENT_SPECS[ArduinoCommand.TEMP.value].page_title,
+                lambda: self._select_live_mode(ArduinoCommand.TEMP.value),
             ),
             (
-                "Temperature Monitor",
-                lambda: self._select_live_mode(
-                    ArduinoCommand.TEMP.value,
-                    "Temperature Monitor",
-                ),
+                MEASUREMENT_SPECS[ArduinoCommand.BPM.value].page_title,
+                lambda: self._select_live_mode(ArduinoCommand.BPM.value),
             ),
             (
-                "Heart Rate Monitor",
-                lambda: self._select_live_mode(
-                    ArduinoCommand.BPM.value,
-                    "Heart Rate Monitor",
-                ),
-            ),
-            (
-                "GSR Monitor",
-                lambda: self._select_live_mode(
-                    ArduinoCommand.GSR.value,
-                    "GSR Monitor",
-                ),
+                MEASUREMENT_SPECS[ArduinoCommand.GSR.value].page_title,
+                lambda: self._select_live_mode(ArduinoCommand.GSR.value),
             ),
             ("Data History", self._show_history_page),
             ("Settings", self._show_settings_page),
@@ -303,7 +242,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(24, 22, 24, 24)
         layout.setSpacing(18)
 
-        self.live_page_title = QLabel("Full BioMonitor")
+        self.live_page_title = QLabel("BioMonitor")
         self.live_page_title.setObjectName("SectionTitle")
         self.live_page_title.setStyleSheet("font-size: 20px; font-weight: 700;")
         layout.addWidget(self.live_page_title)
@@ -311,10 +250,15 @@ class MainWindow(QMainWindow):
         self.test_guide_panel = self._build_test_guide_panel()
         layout.addWidget(self.test_guide_panel)
 
+        self.controls_title = _section_title("Controls")
+        layout.addWidget(self.controls_title)
+        self.controls_panel = self._build_controls_panel()
+        layout.addWidget(self.controls_panel)
+
         self.metrics_title = _section_title("Live Metrics")
         layout.addWidget(self.metrics_title)
-        metrics_grid = QGridLayout()
-        metrics_grid.setSpacing(14)
+        self.metrics_grid = QGridLayout()
+        self.metrics_grid.setSpacing(14)
 
         self.temperature_card = MetricCard("Temperature", "\N{DEGREE SIGN}C")
         self.heart_card = MetricCard("Heart Rate", "BPM")
@@ -322,33 +266,30 @@ class MainWindow(QMainWindow):
         self.gsr_card = MetricCard("GSR", "ADC")
         self.status_card = MetricCard("System Status")
         self.status_card.value_label.setText(STATUS_NORMAL)
-        self.status_card.delta_label.setText("Baseline state: --")
+        self.status_card.delta_label.setText("Baseline not configured")
         self.status_card.set_status(STATUS_NORMAL)
 
-        metrics_grid.addWidget(self.temperature_card, 0, 0)
-        metrics_grid.addWidget(self.heart_card, 0, 1)
-        metrics_grid.addWidget(self.spo2_card, 0, 2)
-        metrics_grid.addWidget(self.gsr_card, 0, 3)
-        metrics_grid.addWidget(self.status_card, 0, 4)
+        self.metrics_grid.addWidget(self.temperature_card, 0, 0)
+        self.metrics_grid.addWidget(self.heart_card, 0, 1)
+        self.metrics_grid.addWidget(self.spo2_card, 0, 2)
+        self.metrics_grid.addWidget(self.gsr_card, 0, 3)
+        self.metrics_grid.addWidget(self.status_card, 0, 4)
         for column in range(5):
-            metrics_grid.setColumnStretch(column, 1)
+            self.metrics_grid.setColumnStretch(column, 1)
 
-        layout.addLayout(metrics_grid)
+        layout.addLayout(self.metrics_grid)
 
         self.charts_title = _section_title("Real-Time Charts")
         layout.addWidget(self.charts_title)
         charts_grid = QGridLayout()
         charts_grid.setSpacing(14)
 
-        history = self.settings.chart_history_seconds
         self.temperature_chart = RealtimeChartWidget(
-            "Temperature", "\N{DEGREE SIGN}C", "#63b3ed", history, y_range=(-20.0, 100.0)
+            "Temperature", "\N{DEGREE SIGN}C", "#63b3ed", y_range=(-20.0, 100.0)
         )
-        self.heart_chart = RealtimeChartWidget("Heart Rate", "BPM", "#e78aa0", history)
-        self.spo2_chart = RealtimeChartWidget(
-            "SpO2", "%", "#f6ad55", history, y_range=(70.0, 100.0)
-        )
-        self.gsr_chart = RealtimeChartWidget("GSR", "ADC", "#68d391", history)
+        self.heart_chart = RealtimeChartWidget("Heart Rate", "BPM", "#e78aa0")
+        self.spo2_chart = RealtimeChartWidget("SpO2", "%", "#f6ad55", y_range=(70.0, 100.0))
+        self.gsr_chart = RealtimeChartWidget("GSR", "ADC", "#68d391")
 
         charts = [
             self.temperature_chart,
@@ -364,10 +305,6 @@ class MainWindow(QMainWindow):
         charts_grid.addWidget(self.gsr_chart, 1, 0)
         charts_grid.addWidget(self.spo2_chart, 1, 1)
         layout.addLayout(charts_grid)
-
-        self.controls_title = _section_title("Controls")
-        layout.addWidget(self.controls_title)
-        layout.addWidget(self._build_controls_panel())
 
         layout.addWidget(_section_title("Event Log"))
         self.event_log = EventLog()
@@ -387,7 +324,7 @@ class MainWindow(QMainWindow):
         self.test_guide_body = QLabel()
         self.test_guide_body.setObjectName("MutedLabel")
         self.test_guide_body.setWordWrap(True)
-        self.test_guide_body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.test_guide_body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.test_guide_body.setStyleSheet("font-size: 13px; line-height: 1.35;")
 
         status_grid = QGridLayout()
@@ -399,6 +336,8 @@ class MainWindow(QMainWindow):
         self.test_state_label = _detail_label("Test state", "Ready.")
         for index, widget in enumerate(
             [
+                self.expected_serial_label,
+                self.last_serial_label,
                 self.last_result_label,
                 self.test_state_label,
             ]
@@ -432,6 +371,7 @@ class MainWindow(QMainWindow):
 
         self.stop_button = QPushButton("Stop")
         self.stop_button.setObjectName("DangerButton")
+        self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self._stop_measurement)
 
         layout = QHBoxLayout(panel)
@@ -457,9 +397,12 @@ class MainWindow(QMainWindow):
         self.table_view = QTableView()
         self.table_view.setModel(self.table_model)
         self.table_view.setAlternatingRowColors(True)
-        self.table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table_view.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table_view.verticalHeader().setVisible(False)
-        self.table_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.table_view.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         layout.addWidget(self.table_view, stretch=1)
 
         actions = QHBoxLayout()
@@ -490,7 +433,9 @@ class MainWindow(QMainWindow):
         self.settings_port_combo = QComboBox()
         self.settings_refresh_button = QPushButton("Refresh Ports")
         self.settings_refresh_button.clicked.connect(
-            lambda: self._populate_ports(self._current_port())
+            lambda: self._populate_ports(
+                str(self.settings_port_combo.currentData() or self.settings.com_port)
+            )
         )
 
         port_row = QHBoxLayout()
@@ -498,26 +443,9 @@ class MainWindow(QMainWindow):
         port_row.addWidget(self.settings_refresh_button)
         form.addRow("COM port", port_row)
 
-        self.baud_spin = QSpinBox()
-        self.baud_spin.setRange(1200, 115200)
-        self.baud_spin.setSingleStep(1200)
-        form.addRow("Baud rate", self.baud_spin)
-
-        self.sampling_spin = QSpinBox()
-        self.sampling_spin.setRange(100, 10000)
-        self.sampling_spin.setSingleStep(100)
-        self.sampling_spin.setSuffix(" ms")
-        form.addRow("Sampling interval", self.sampling_spin)
-
         self.theme_combo = QComboBox()
-        self.theme_combo.addItems(["Medical Dark", "High Contrast Dark"])
+        self.theme_combo.addItems([THEME_MEDICAL_DARK, THEME_HIGH_CONTRAST_DARK])
         form.addRow("Theme", self.theme_combo)
-
-        self.history_spin = QSpinBox()
-        self.history_spin.setRange(30, 3600)
-        self.history_spin.setSingleStep(30)
-        self.history_spin.setSuffix(" s")
-        form.addRow("Chart history length", self.history_spin)
 
         self.data_folder_edit = QLineEdit()
         browse_button = QPushButton("Browse")
@@ -538,9 +466,7 @@ class MainWindow(QMainWindow):
 
     def _populate_ports(self, selected_port: str | None = None) -> None:
         ports = available_ports()
-        combos = [self.port_combo]
-        if hasattr(self, "settings_port_combo"):
-            combos.append(self.settings_port_combo)
+        combos = [self.port_combo, self.settings_port_combo]
 
         for combo in combos:
             current = selected_port or combo.currentData() or self.settings.com_port
@@ -561,9 +487,6 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_settings_to_controls(self) -> None:
-        self.baud_spin.setValue(self.settings.baud_rate)
-        self.sampling_spin.setValue(self.settings.sampling_interval_ms)
-        self.history_spin.setValue(self.settings.chart_history_seconds)
         self.data_folder_edit.setText(str(self.settings.data_folder))
         theme_index = self.theme_combo.findText(self.settings.theme)
         self.theme_combo.setCurrentIndex(max(theme_index, 0))
@@ -576,39 +499,66 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.dashboard_page)
 
     def _show_history_page(self) -> None:
+        self._stop_active_test_for_navigation()
         self._refresh_history()
         self.stack.setCurrentWidget(self.history_page)
 
     def _show_settings_page(self) -> None:
+        self._stop_active_test_for_navigation()
         self.stack.setCurrentWidget(self.settings_page)
 
-    def _select_live_mode(
-        self,
-        command: str,
-        title: str,
-    ) -> None:
+    def _stop_active_test_for_navigation(self) -> None:
+        if self.active_test_command is not None:
+            self._finish_individual_test(stopped_by_user=True)
+
+    def _select_live_mode(self, command: str) -> None:
+        if self.active_test_command is not None and command != self.active_test_command:
+            self._finish_individual_test(stopped_by_user=True)
+
+        spec = measurement_spec(command)
+        if command == BIOMONITOR_VIEW:
+            title = "BioMonitor"
+        elif spec is not None:
+            title = spec.page_title
+        else:
+            self.event_log.append_event(f"Unsupported view command: {command}", "ERROR")
+            return
         self.selected_command = command
-        self.selected_page_title = title
+        self._clear_invalid_measurement(command)
         self.live_page_title.setText(title)
         self._apply_live_mode_visibility()
         self._update_selected_mode_controls()
         self._show_dashboard_page()
-        self._update_mode_indicator(f"{command} READY")
+        self._update_mode_indicator(_ready_mode_for_view(command))
 
     def _apply_live_mode_visibility(self) -> None:
         command = self.selected_command
-        show_all = command == ArduinoCommand.ALL.value
-        show_temperature = show_all or command == ArduinoCommand.TEMP.value
-        show_heart = show_all or command == ArduinoCommand.BPM.value
-        show_gsr = show_all or command == ArduinoCommand.GSR.value
+        show_overview = command == BIOMONITOR_VIEW
+        show_temperature = show_overview or command == ArduinoCommand.TEMP.value
+        show_heart = show_overview or command == ArduinoCommand.BPM.value
+        show_gsr = show_overview or command == ArduinoCommand.GSR.value
 
+        self.controls_title.setVisible(not show_overview)
+        self.controls_panel.setVisible(not show_overview)
+        self.metrics_title.setText("Latest Results" if show_overview else "Live Metrics")
+        self.charts_title.setText("Measurement History" if show_overview else "Real-Time Charts")
         self.metrics_title.setVisible(True)
         self.charts_title.setVisible(True)
         self.temperature_card.setVisible(show_temperature)
         self.heart_card.setVisible(show_heart)
         self.spo2_card.setVisible(show_heart)
         self.gsr_card.setVisible(show_gsr)
-        self.status_card.setVisible(show_all)
+        self.status_card.setVisible(show_overview)
+
+        visible_columns = {
+            0: show_temperature,
+            1: show_heart,
+            2: show_heart,
+            3: show_gsr,
+            4: show_overview,
+        }
+        for column, visible in visible_columns.items():
+            self.metrics_grid.setColumnStretch(column, 1 if visible else 0)
 
         self.temperature_chart.setVisible(show_temperature)
         self.heart_chart.setVisible(show_heart)
@@ -617,30 +567,34 @@ class MainWindow(QMainWindow):
 
     def _update_selected_mode_controls(self) -> None:
         command = self.selected_command
+        is_test = is_measurement_command(command)
+        self.test_guide_panel.setVisible(is_test)
+        if not is_test:
+            return
+
         self.start_button.setText("Start Test")
         self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
 
-        title, body = _test_protocol_text(command)
-        self.test_guide_title.setText(title)
-        self.test_guide_body.setText(body)
-        self.expected_serial_label.setText(
-            f"Expected Arduino data\n{_expected_serial_format(command) or '--'}"
-        )
+        spec = measurement_spec(command)
+        if spec is None:
+            return
+
+        self.test_guide_title.setText(spec.test_title)
+        self.test_guide_body.setText(spec.instructions)
+        self.expected_serial_label.setText(f"Expected Arduino data\n{spec.expected_serial}")
+        if self.active_test_command == command:
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+            return
+
         self.last_serial_label.setText(f"Last Arduino line\n{self.last_raw_line}")
         self.last_result_label.setText("Latest valid result\nWaiting for Start Test.")
         self.test_state_label.setText("Test state\nReady. Connect Arduino, then click Start Test.")
-        duration = _test_duration_seconds(command)
         self.test_progress_bar.setValue(0)
         self.test_progress_label.setText(
-            f"Progress: test duration {duration} seconds."
-            if duration
-            else "Progress: not available."
+            f"Progress: test duration {spec.duration_seconds} seconds."
         )
-        self.test_guide_panel.setVisible(command in {
-            ArduinoCommand.TEMP.value,
-            ArduinoCommand.GSR.value,
-            ArduinoCommand.BPM.value,
-        })
 
     def _is_serial_connected(self) -> bool:
         worker = self.serial_worker
@@ -650,6 +604,9 @@ class MainWindow(QMainWindow):
         if self.serial_worker is not None and self.serial_worker.isRunning():
             self.event_log.append_event("Serial connection is already active.", "INFO")
             return
+        if self.serial_worker is not None:
+            self.serial_worker.deleteLater()
+            self.serial_worker = None
 
         port = self._current_port()
         if not port:
@@ -657,17 +614,24 @@ class MainWindow(QMainWindow):
             return
 
         self.settings.com_port = port
-        self.settings.baud_rate = self.baud_spin.value()
-        self.settings_manager.save(self.settings)
+        try:
+            self.settings_manager.save(self.settings)
+        except OSError as exc:
+            self.event_log.append_event(
+                f"Could not remember the selected serial port: {exc}",
+                "ERROR",
+            )
 
-        self.serial_worker = ArduinoSerialWorker(port, baud_rate=self.settings.baud_rate)
-        self.serial_worker.connected.connect(self._on_serial_connected)
-        self.serial_worker.disconnected.connect(self._on_serial_disconnected)
-        self.serial_worker.raw_received.connect(self._on_raw_serial_received)
-        self.serial_worker.sample_received.connect(self._on_sample_received)
-        self.serial_worker.error.connect(self._on_serial_error)
-        self.serial_worker.start()
-        self.event_log.append_event(f"Connecting to {port} at {self.settings.baud_rate} baud.")
+        worker = ArduinoSerialWorker(port, parent=self)
+        worker.connected.connect(self._on_serial_connected)
+        worker.disconnected.connect(self._on_serial_disconnected)
+        worker.finished.connect(self._on_serial_worker_finished)
+        worker.raw_received.connect(self._on_raw_serial_received)
+        worker.sample_received.connect(self._on_sample_received)
+        worker.error.connect(self._on_serial_error)
+        self.serial_worker = worker
+        worker.start()
+        self.event_log.append_event(f"Connecting to {port} at {SERIAL_BAUD_RATE} baud.")
 
     def _disconnect_serial(self) -> None:
         worker = self.serial_worker
@@ -678,8 +642,14 @@ class MainWindow(QMainWindow):
         if worker.isRunning():
             worker.send_command(ArduinoCommand.STOP.value)
             worker.stop()
-            worker.wait(1500)
-        self.serial_worker = None
+            if not worker.wait(3000):
+                self.event_log.append_event(
+                    "Serial worker did not stop cleanly; forcing shutdown.", "ERROR"
+                )
+                worker.terminate()
+                worker.wait(1000)
+        if self.serial_worker is worker:
+            self.serial_worker = None
         self._set_connected(False)
         self._update_mode_indicator(ArduinoCommand.STOP.value)
         self.event_log.append_event("Disconnected from Arduino.")
@@ -688,13 +658,20 @@ class MainWindow(QMainWindow):
     def _on_serial_connected(self, port: str) -> None:
         self._set_connected(True)
         self.event_log.append_event(f"Connected to Arduino on {port}.")
-        self._update_mode_indicator(f"{self.selected_command} READY")
+        self._update_mode_indicator(_ready_mode_for_view(self.selected_command))
 
     @Slot()
     def _on_serial_disconnected(self) -> None:
         self._set_connected(False)
         self._update_mode_indicator(ArduinoCommand.STOP.value)
-        self.serial_worker = None
+
+    @Slot()
+    def _on_serial_worker_finished(self) -> None:
+        worker = self.sender()
+        if worker is self.serial_worker:
+            self.serial_worker = None
+        if worker is not None:
+            worker.deleteLater()
 
     @Slot(str)
     def _on_serial_error(self, message: str) -> None:
@@ -703,14 +680,14 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_raw_serial_received(self, line: str) -> None:
         self.last_raw_line = line
-        if _is_individual_test_command(self.selected_command):
+        if is_measurement_command(self.selected_command):
             self.last_serial_label.setText(f"Last Arduino line\n{line}")
             if self.active_test_command is not None:
-                fallback_value = _numeric_value_from_raw_line(line, self.active_test_command)
+                fallback_value = numeric_value_from_raw_line(line, self.active_test_command)
                 if fallback_value is not None:
                     self._collect_individual_test_value(fallback_value, line)
                     return
-            if not _line_matches_selected_command(line, self.selected_command):
+            if not line_matches_command(line, self.selected_command):
                 self.test_state_label.setText(
                     "Test state\nArduino is connected, but this line is not a valid "
                     "result for this test."
@@ -720,9 +697,9 @@ class MainWindow(QMainWindow):
         self.connect_button.setEnabled(not connected)
         self.disconnect_button.setEnabled(connected)
         if connected:
-            self.connection_indicator.set_status("CONNECTED", COLOR_SUCCESS)
+            self.connection_indicator.set_status("CONNECTED")
         else:
-            self.connection_indicator.set_status("OFFLINE", COLOR_MUTED)
+            self.connection_indicator.set_status("OFFLINE")
 
     def _send_command(self, command: str, source: str) -> bool:
         worker = self.serial_worker
@@ -740,26 +717,10 @@ class MainWindow(QMainWindow):
         return True
 
     def _update_mode_indicator(self, mode: str) -> None:
-        self.current_mode = mode
         self.mode_indicator.setText(f"Mode: {mode}")
 
     def _start_measurement(self) -> None:
-        if _is_individual_test_command(self.selected_command):
-            self._start_individual_test()
-            return
-
-        if self._send_command(self.selected_command, source=self.start_button.text()):
-            self.current_test_sample_count = 0
-            expected = _expected_serial_format(self.selected_command)
-            if expected:
-                self.last_result_label.setText("Latest valid result\nNo valid sample received yet.")
-                self.test_state_label.setText(
-                    "Test state\nWaiting for the first valid Arduino sample."
-                )
-                self.event_log.append_event(
-                    f"Waiting for Arduino data in format {expected}.",
-                    "INFO",
-                )
+        self._start_individual_test()
 
     def _stop_measurement(self) -> None:
         if self.active_test_command is not None:
@@ -772,8 +733,8 @@ class MainWindow(QMainWindow):
             self.event_log.append_event("A test is already running.", "INFO")
             return
 
-        duration = _test_duration_seconds(self.selected_command)
-        if duration <= 0:
+        spec = measurement_spec(self.selected_command)
+        if spec is None:
             self.event_log.append_event("This test is not available yet.", "ERROR")
             return
 
@@ -782,7 +743,7 @@ class MainWindow(QMainWindow):
 
         self.active_test_command = self.selected_command
         self.active_test_started_at = datetime.now()
-        self.active_test_duration_seconds = duration
+        self.active_test_duration_seconds = spec.duration_seconds
         self.active_test_values.clear()
         self.current_test_sample_count = 0
         self.start_button.setEnabled(False)
@@ -794,7 +755,7 @@ class MainWindow(QMainWindow):
         )
         self.test_timer.start()
         self.event_log.append_event(
-            f"{self.selected_page_title}: collecting one final result for {duration} seconds.",
+            f"{spec.page_title}: collecting one final result for {spec.duration_seconds} seconds.",
             "USER",
         )
 
@@ -824,22 +785,24 @@ class MainWindow(QMainWindow):
         self.active_test_command = None
         self.active_test_started_at = None
         self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
 
         if not self.active_test_values:
-            expected = _expected_serial_format(command)
+            spec = measurement_spec(command)
+            expected = spec.expected_serial if spec is not None else command
             self.test_state_label.setText(
                 "Test state\nFinished, but no valid samples were received from Arduino. "
                 f"Expected {expected}; last line was: {self.last_raw_line}"
             )
             self.last_result_label.setText("Latest valid result\nNo result saved.")
             self.event_log.append_event(
-                f"{self.selected_page_title}: no valid data received. Expected {expected}; "
+                f"{measurement_name(command)}: no valid data received. Expected {expected}; "
                 f"last Arduino line: {self.last_raw_line}",
                 "ERROR",
             )
             return
 
-        final_value = _final_test_value(self.active_test_values)
+        final_value = final_test_value(self.active_test_values)
         sample = self._sample_from_final_value(command, final_value)
         self.session_store.append(sample)
         display_sample = self._latest_metrics_sample(sample.timestamp)
@@ -849,14 +812,12 @@ class MainWindow(QMainWindow):
 
         self.test_progress_bar.setValue(100)
         self.test_progress_label.setText("Progress: completed.")
-        result_text = _format_test_value(command, final_value)
+        result_text = format_test_value(command, final_value)
         suffix = "stopped early" if stopped_by_user else "completed"
         self.last_result_label.setText(f"Latest valid result\n{result_text}")
-        self.test_state_label.setText(
-            f"Test state\nTest {suffix}. Final result was saved."
-        )
+        self.test_state_label.setText(f"Test state\nTest {suffix}. Final result was saved.")
         self.event_log.append_event(
-            f"{self.selected_page_title}: final result saved: {result_text}.",
+            f"{measurement_name(command)}: final result saved: {result_text}.",
             "USER",
         )
 
@@ -864,16 +825,16 @@ class MainWindow(QMainWindow):
         sample = SensorSample(timestamp=datetime.now())
         if command == ArduinoCommand.TEMP.value:
             sample.temperature = value
-            self.latest_temperature = value
+            self.latest_readings.temperature = value
         elif command == ArduinoCommand.GSR.value:
             sample.gsr = value
-            self.latest_gsr = value
+            self.latest_readings.gsr = value
         elif command == ArduinoCommand.BPM.value:
             sample.heart_rate = value
-            self.latest_heart_rate = value
-            sample.spo2 = self.latest_spo2
-            sample.pulse_valid = self.latest_pulse_valid
-            sample.pulse_temperature = self.latest_pulse_temperature
+            self.latest_readings.heart_rate = value
+            sample.spo2 = self.latest_readings.spo2
+            sample.pulse_valid = self.latest_readings.pulse_valid
+            sample.pulse_temperature = self.latest_readings.pulse_temperature
 
         score = self.score_calculator.calculate_score(sample)
         sample.bioscore = score
@@ -882,76 +843,32 @@ class MainWindow(QMainWindow):
 
     @Slot(object, str)
     def _on_sample_received(self, parsed: ParsedMessage, raw: str) -> None:
-        if self.active_test_command is not None:
-            self._collect_individual_test_sample(parsed, raw)
+        if self.active_test_command is None:
             return
-
-        if parsed.temperature is not None:
-            self.latest_temperature = parsed.temperature
-        if parsed.heart_rate is not None:
-            self.latest_heart_rate = parsed.heart_rate
-        if parsed.spo2 is not None:
-            self.latest_spo2 = parsed.spo2
-        if parsed.pulse_valid is not None:
-            self.latest_pulse_valid = parsed.pulse_valid
-        if parsed.pulse_temperature is not None:
-            self.latest_pulse_temperature = parsed.pulse_temperature
-        if parsed.gsr is not None:
-            self.latest_gsr = parsed.gsr
-
-        sample = SensorSample(
-            timestamp=datetime.now(),
-            temperature=self.latest_temperature
-            if self.selected_command in {ArduinoCommand.ALL.value, ArduinoCommand.TEMP.value}
-            else None,
-            heart_rate=self.latest_heart_rate
-            if self.selected_command in {ArduinoCommand.ALL.value, ArduinoCommand.BPM.value}
-            else None,
-            spo2=self.latest_spo2
-            if self.selected_command in {ArduinoCommand.ALL.value, ArduinoCommand.BPM.value}
-            else None,
-            pulse_valid=self.latest_pulse_valid
-            if self.selected_command in {ArduinoCommand.ALL.value, ArduinoCommand.BPM.value}
-            else None,
-            pulse_temperature=self.latest_pulse_temperature
-            if self.selected_command in {ArduinoCommand.ALL.value, ArduinoCommand.BPM.value}
-            else None,
-            gsr=self.latest_gsr
-            if self.selected_command in {ArduinoCommand.ALL.value, ArduinoCommand.GSR.value}
-            else None,
-        )
-        score = self.score_calculator.calculate_score(sample)
-        sample.bioscore = score
-        sample.status = status_for_score(score)
-
-        self.session_store.append(sample)
-        self.current_test_sample_count += 1
-
-        display_sample = self._latest_metrics_sample(sample.timestamp)
-        self._update_live_metrics(display_sample)
-        self._update_charts(sample)
-        self._update_test_result_panel(sample, raw)
-        self._refresh_history()
-
-        if display_sample.status != self.last_status:
-            self.event_log.append_event(
-                f"System status changed to {display_sample.status}.", "SENSOR"
-            )
-            self.last_status = display_sample.status
+        self._collect_individual_test_sample(parsed, raw)
 
     def _collect_individual_test_sample(self, parsed: ParsedMessage, raw: str) -> None:
         command = self.active_test_command
         if command is None:
             return
 
-        if parsed.spo2 is not None:
-            self.latest_spo2 = parsed.spo2
-        if parsed.pulse_valid is not None:
-            self.latest_pulse_valid = parsed.pulse_valid
-        if parsed.pulse_temperature is not None:
-            self.latest_pulse_temperature = parsed.pulse_temperature
+        invalid_reason = invalid_measurement_reason(parsed, command)
+        if invalid_reason is not None:
+            self._report_invalid_measurement(command, invalid_reason, raw)
+            self.last_serial_label.setText(f"Last Arduino line\n{raw}")
+            self.last_result_label.setText("Latest valid result\nInvalid sample ignored.")
+            self.test_state_label.setText(f"Test state\nInvalid sample: {invalid_reason}")
+            return
 
-        value = _value_for_command(parsed, command)
+        self._clear_invalid_measurement(command)
+        if parsed.spo2 is not None:
+            self.latest_readings.spo2 = parsed.spo2
+        if parsed.pulse_valid is not None:
+            self.latest_readings.pulse_valid = parsed.pulse_valid
+        if parsed.pulse_temperature is not None:
+            self.latest_readings.pulse_temperature = parsed.pulse_temperature
+
+        value = value_for_command(parsed, command)
         self.last_serial_label.setText(f"Last Arduino line\n{raw}")
         if value is None:
             self.test_state_label.setText(
@@ -966,60 +883,57 @@ class MainWindow(QMainWindow):
         if command is None:
             return
 
+        self._clear_invalid_measurement(command)
         self.last_serial_label.setText(f"Last Arduino line\n{raw}")
         self.active_test_values.append(value)
         self.current_test_sample_count += 1
         self.last_result_label.setText(
-            f"Latest valid result\nCurrent: {_format_test_value(command, value)} "
+            f"Latest valid result\nCurrent: {format_test_value(command, value)} "
             f"({self.current_test_sample_count} samples)"
         )
         self.test_state_label.setText("Test state\nCollecting valid samples for one final result.")
-
-    def _update_test_result_panel(self, sample: SensorSample, raw: str) -> None:
-        if not _is_individual_test_command(self.selected_command):
-            return
-
-        value_text = "--"
-        if self.selected_command == ArduinoCommand.TEMP.value:
-            value_text = f"{_format_number(sample.temperature, 1)} °C"
-        elif self.selected_command == ArduinoCommand.GSR.value:
-            value_text = f"{_format_number(sample.gsr, 0)} ADC"
-        elif self.selected_command == ArduinoCommand.BPM.value:
-            value_text = (
-                f"{_format_number(sample.heart_rate, 0)} BPM, "
-                f"SpO2 {_format_number(sample.spo2, 0)}%, "
-                f"valid {_format_bool(sample.pulse_valid)}"
-            )
-
-        self.last_serial_label.setText(f"Last Arduino line\n{raw}")
-        self.last_result_label.setText(
-            f"Latest valid result\n{value_text} ({self.current_test_sample_count} samples)"
-        )
-        self.test_state_label.setText("Test state\nReceiving valid data.")
 
     def _update_live_metrics(self, sample: SensorSample) -> None:
         deltas = self.score_calculator.calculate_deltas(sample)
 
         self.temperature_card.set_value(sample.temperature, precision=1)
         self.temperature_card.set_delta(deltas.temperature, precision=1)
-        self.temperature_card.set_status(_temperature_status(sample.temperature))
+        self.temperature_card.set_status(temperature_status(sample.temperature))
 
         self.heart_card.set_value(sample.heart_rate, precision=0)
         self.heart_card.set_delta(deltas.heart_rate, precision=0)
-        self.heart_card.set_status(_heart_status(sample.heart_rate))
+        self.heart_card.set_status(heart_status(sample.heart_rate))
 
         self.spo2_card.set_value(sample.spo2, precision=0)
         self.spo2_card.set_delta(None)
-        self.spo2_card.set_status(_spo2_status(sample.spo2, sample.pulse_valid))
+        self.spo2_card.set_status(spo2_status(sample.spo2, sample.pulse_valid))
 
         self.gsr_card.set_value(sample.gsr, precision=0)
-        self.gsr_card.set_delta(deltas.gsr, precision=0)
-        self.gsr_card.set_status(_gsr_status(deltas))
+        self.gsr_card.delta_label.setText(gsr_assessment_detail(sample.gsr, deltas.gsr))
+        self.gsr_card.set_status(gsr_assessment_label(sample.gsr, deltas.gsr))
 
         self.status_card.value_label.setText(sample.status)
-        self.status_card.delta_label.setText("Baseline state active")
+        self.status_card.delta_label.setText(
+            "Baseline state active"
+            if self.score_calculator.has_baseline
+            else "Baseline not configured"
+        )
         self.status_card.set_status(sample.status)
         self.status_card.value_label.setStyleSheet(f"color: {color_for_status(sample.status)};")
+
+    def _report_invalid_measurement(self, command: str, reason: str, raw: str) -> None:
+        if self._invalid_reason_by_command.get(command) == reason:
+            return
+
+        self._invalid_reason_by_command[command] = reason
+        test_name = measurement_name(command)
+        self.event_log.append_event(
+            f"{test_name} result is INVALID: {reason} Raw data: {raw}",
+            "ERROR",
+        )
+
+    def _clear_invalid_measurement(self, command: str) -> None:
+        self._invalid_reason_by_command.pop(command, None)
 
     def _update_charts(self, sample: SensorSample) -> None:
         self.temperature_chart.add_sample(sample.timestamp, sample.temperature)
@@ -1035,31 +949,29 @@ class MainWindow(QMainWindow):
         for sample in samples:
             self._update_charts(sample)
             if sample.temperature is not None:
-                self.latest_temperature = sample.temperature
+                self.latest_readings.temperature = sample.temperature
             if sample.heart_rate is not None:
-                self.latest_heart_rate = sample.heart_rate
+                self.latest_readings.heart_rate = sample.heart_rate
             if sample.spo2 is not None:
-                self.latest_spo2 = sample.spo2
+                self.latest_readings.spo2 = sample.spo2
             if sample.pulse_valid is not None:
-                self.latest_pulse_valid = sample.pulse_valid
+                self.latest_readings.pulse_valid = sample.pulse_valid
             if sample.pulse_temperature is not None:
-                self.latest_pulse_temperature = sample.pulse_temperature
+                self.latest_readings.pulse_temperature = sample.pulse_temperature
             if sample.gsr is not None:
-                self.latest_gsr = sample.gsr
-            self.last_status = sample.status
+                self.latest_readings.gsr = sample.gsr
 
         self._update_live_metrics(self._latest_metrics_sample(samples[-1].timestamp))
 
     def _latest_metrics_sample(self, timestamp: datetime) -> SensorSample:
         sample = SensorSample(
             timestamp=timestamp,
-            temperature=self.latest_temperature,
-            heart_rate=self.latest_heart_rate,
-            spo2=self.latest_spo2,
-            pulse_valid=self.latest_pulse_valid,
-            pulse_temperature=self.latest_pulse_temperature,
-            gsr=self.latest_gsr,
-            status=self.last_status,
+            temperature=self.latest_readings.temperature,
+            heart_rate=self.latest_readings.heart_rate,
+            spo2=self.latest_readings.spo2,
+            pulse_valid=self.latest_readings.pulse_valid,
+            pulse_temperature=self.latest_readings.pulse_temperature,
+            gsr=self.latest_readings.gsr,
         )
         sample.bioscore = self.score_calculator.calculate_score(sample)
         sample.status = status_for_score(sample.bioscore)
@@ -1070,14 +982,8 @@ class MainWindow(QMainWindow):
         self.table_model.set_samples(list(reversed(samples[-1000:])))
         self.history_summary.setText(f"{len(samples)} saved samples.")
 
-    def _reset_data(self) -> None:
-        self.session_store.clear()
-        self.latest_temperature = None
-        self.latest_heart_rate = None
-        self.latest_spo2 = None
-        self.latest_pulse_valid = None
-        self.latest_pulse_temperature = None
-        self.latest_gsr = None
+    def _clear_dashboard_display(self) -> None:
+        self.latest_readings = SensorSample(timestamp=datetime.now())
         self.temperature_chart.clear()
         self.heart_chart.clear()
         self.spo2_chart.clear()
@@ -1094,12 +1000,11 @@ class MainWindow(QMainWindow):
         self.spo2_card.set_delta(None)
         self.spo2_card.set_status("WAITING")
         self.gsr_card.set_value(None)
-        self.gsr_card.set_delta(None)
-        self.gsr_card.set_status("WAITING")
+        self.gsr_card.delta_label.setText("Assessment: no data")
+        self.gsr_card.set_status("NO DATA")
         self.status_card.value_label.setText(STATUS_NORMAL)
-        self.status_card.delta_label.setText("Baseline state: --")
+        self.status_card.delta_label.setText("Baseline not configured")
         self.status_card.set_status(STATUS_NORMAL)
-        self.event_log.append_event("Recorded data reset.", "USER")
 
     def _export_csv(self) -> None:
         if not self.session_store.samples:
@@ -1116,26 +1021,12 @@ class MainWindow(QMainWindow):
         if not selected:
             return
 
-        path = self.session_store.export_csv(Path(selected))
+        try:
+            path = self.session_store.export_csv(Path(selected))
+        except OSError as exc:
+            self.event_log.append_event(f"CSV export failed: {exc}", "ERROR")
+            return
         self.event_log.append_event(f"CSV exported to {path}.", "USER")
-
-    def _export_report(self) -> None:
-        if not self.session_store.samples:
-            self.event_log.append_event("Report export skipped: no samples recorded.", "ERROR")
-            return
-
-        default_path = timestamped_path(self.settings.data_folder, "biomonitor_report", ".html")
-        selected, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Report",
-            str(default_path),
-            "HTML Report (*.html)",
-        )
-        if not selected:
-            return
-
-        path = self.session_store.export_report(Path(selected))
-        self.event_log.append_event(f"Report exported to {path}.", "USER")
 
     def _browse_data_folder(self) -> None:
         selected = QFileDialog.getExistingDirectory(
@@ -1147,24 +1038,64 @@ class MainWindow(QMainWindow):
             self.data_folder_edit.setText(selected)
 
     def _save_settings(self) -> None:
-        selected_port = self.settings_port_combo.currentData() or self._current_port()
-        self.settings = AppSettings(
-            com_port=str(selected_port or ""),
-            baud_rate=self.baud_spin.value(),
-            sampling_interval_ms=self.sampling_spin.value(),
-            theme=self.theme_combo.currentText(),
-            chart_history_seconds=self.history_spin.value(),
-            data_folder=Path(self.data_folder_edit.text()).expanduser(),
+        folder_text = self.data_folder_edit.text().strip()
+        if not folder_text:
+            self.event_log.append_event("Data folder cannot be empty.", "ERROR")
+            return
+
+        selected_port = (
+            self.settings_port_combo.currentData() or self._current_port() or self.settings.com_port
         )
-        self.settings_manager.save(self.settings)
-        self.session_store = SessionStore(self.settings.data_folder / "biomonitor.sqlite3")
-        self.temperature_chart.set_history_seconds(self.settings.chart_history_seconds)
-        self.heart_chart.set_history_seconds(self.settings.chart_history_seconds)
-        self.spo2_chart.set_history_seconds(self.settings.chart_history_seconds)
-        self.gsr_chart.set_history_seconds(self.settings.chart_history_seconds)
+        new_settings = AppSettings(
+            com_port=str(selected_port or ""),
+            theme=self.theme_combo.currentText(),
+            data_folder=Path(folder_text).expanduser().resolve(),
+        )
+        try:
+            new_store = SessionStore(new_settings.data_folder / "biomonitor.sqlite3")
+            self.settings_manager.save(new_settings)
+        except (OSError, sqlite3.Error) as exc:
+            self.event_log.append_event(f"Could not save settings: {exc}", "ERROR")
+            return
+
+        data_folder_changed = new_settings.data_folder != self.settings.data_folder
+        self.settings = new_settings
+        if data_folder_changed:
+            self.session_store = new_store
+            self._clear_dashboard_display()
+            self._restore_saved_dashboard_data()
+
+        app = QApplication.instance()
+        if isinstance(app, QApplication):
+            apply_theme(app, self.settings.theme)
+        self._apply_chart_theme()
+        self._refresh_status_colors()
         self._populate_ports(self.settings.com_port)
         self._refresh_history()
         self.event_log.append_event("Settings saved.", "USER")
+
+    def _apply_chart_theme(self) -> None:
+        for chart in [
+            self.temperature_chart,
+            self.heart_chart,
+            self.spo2_chart,
+            self.gsr_chart,
+        ]:
+            chart.apply_theme()
+
+    def _refresh_status_colors(self) -> None:
+        self._set_connected(self._is_serial_connected())
+        for card in [
+            self.temperature_card,
+            self.heart_card,
+            self.spo2_card,
+            self.gsr_card,
+            self.status_card,
+        ]:
+            card.set_status(card.status.label.text())
+        self.status_card.value_label.setStyleSheet(
+            f"color: {color_for_status(self.status_card.value_label.text())};"
+        )
 
 
 def _section_title(text: str) -> QLabel:
@@ -1175,187 +1106,13 @@ def _section_title(text: str) -> QLabel:
 
 def _detail_label(title: str, value: str) -> QLabel:
     label = QLabel(f"{title}\n{value}")
-    label.setObjectName("MutedLabel")
+    label.setObjectName("DetailLabel")
     label.setWordWrap(True)
     label.setMinimumHeight(58)
-    label.setStyleSheet(
-        "background: #111821; border: 1px solid #263341; border-radius: 7px; "
-        "padding: 9px 10px; font-size: 12px;"
-    )
     return label
 
 
-def _test_protocol_text(command: str) -> tuple[str, str]:
-    if command == ArduinoCommand.TEMP.value:
-        return (
-            "Temperature Test",
-            "1. Podlacz Arduino i upewnij sie, ze status polaczenia to CONNECTED.\n"
-            "2. Umiesc czujnik temperatury w wybranym miejscu.\n"
-            "3. Utrzymuj czujnik nieruchomo i nie zmieniaj nacisku podczas testu.\n"
-            "4. Kliknij Start Test.\n"
-            "5. Poczekaj do konca paska postepu.",
-        )
-    if command == ArduinoCommand.GSR.value:
-        return (
-            "GSR Test",
-            "1. Zaloz elektrody na te same palce przed kazdym pomiarem.\n"
-            "2. Nie sciskaj elektrod zbyt mocno.\n"
-            "3. Usiadz spokojnie i ogranicz ruch dloni.\n"
-            "4. Kliknij Start Test.\n"
-            "5. Trzymaj dlon w tej samej pozycji do konca paska postepu.",
-        )
-    if command == ArduinoCommand.BPM.value:
-        return (
-            "Heart Rate Test",
-            "1. Poloz opuszek palca na sensorze tetna.\n"
-            "2. Nie dociskaj palca zbyt mocno.\n"
-            "3. Nie przesuwaj palca podczas pomiaru.\n"
-            "4. Oddychaj spokojnie i nie rozmawiaj w trakcie testu.\n"
-            "5. Kliknij Start Test i poczekaj 30 sekund.",
-        )
-    if command == ArduinoCommand.ALL.value:
-        return ("", "")
-    return ("Test Protocol", "")
-
-
-def _expected_serial_format(command: str) -> str:
-    if command == ArduinoCommand.TEMP.value:
-        return "TEMP:36.2"
-    if command == ArduinoCommand.GSR.value:
-        return "GSR:542"
-    if command == ArduinoCommand.BPM.value:
-        return "BPM:74,SPO2:97,PULSE_VALID:1,PULSE_TEMP:31.50"
-    if command == ArduinoCommand.ALL.value:
-        return "BPM:74,SPO2:97,PULSE_VALID:1,TEMP:35.82,GSR:542,PULSE_TEMP:31.50"
-    return ""
-
-
-def _test_duration_seconds(command: str) -> int:
-    if command == ArduinoCommand.TEMP.value:
-        return 10
-    if command == ArduinoCommand.GSR.value:
-        return 10
-    if command == ArduinoCommand.BPM.value:
-        return 30
-    return 0
-
-
-def _value_for_command(parsed: ParsedMessage, command: str) -> float | None:
-    if command == ArduinoCommand.TEMP.value:
-        return parsed.temperature
-    if command == ArduinoCommand.GSR.value:
-        return parsed.gsr
-    if command == ArduinoCommand.BPM.value:
-        return parsed.heart_rate
-    return None
-
-
-def _final_test_value(values: list[float]) -> float:
-    stable_values = values[-10:] if len(values) >= 10 else values
-    return sum(stable_values) / len(stable_values)
-
-
-def _format_test_value(command: str, value: float) -> str:
-    if command == ArduinoCommand.TEMP.value:
-        return f"{value:.1f} \N{DEGREE SIGN}C"
-    if command == ArduinoCommand.GSR.value:
-        return f"{value:.0f} ADC"
-    if command == ArduinoCommand.BPM.value:
-        return f"{value:.0f} BPM"
-    return f"{value:.2f}"
-
-
-def _numeric_value_from_raw_line(line: str, command: str) -> float | None:
-    cleaned = line.strip().replace(",", ".")
-    if ":" in cleaned:
-        return None
-
-    try:
-        value = float(cleaned)
-    except ValueError:
-        return None
-
-    if command == ArduinoCommand.TEMP.value and -50.0 <= value <= 150.0:
-        return value
-    if command == ArduinoCommand.GSR.value and 0.0 <= value <= 1023.0:
-        return value
-    if command == ArduinoCommand.BPM.value and 20.0 <= value <= 240.0:
-        return value
-    return None
-
-
-def _line_matches_selected_command(line: str, command: str) -> bool:
-    normalized = line.strip().upper()
-    if command == ArduinoCommand.TEMP.value:
-        return normalized.startswith("TEMP:")
-    if command == ArduinoCommand.GSR.value:
-        return normalized.startswith("GSR:")
-    if command == ArduinoCommand.BPM.value:
-        return normalized.startswith("BPM:")
-    if command == ArduinoCommand.ALL.value:
-        return any(part in normalized for part in ["TEMP:", "GSR:", "BPM:"])
-    return False
-
-
-def _is_individual_test_command(command: str) -> bool:
-    return command in {
-        ArduinoCommand.TEMP.value,
-        ArduinoCommand.GSR.value,
-        ArduinoCommand.BPM.value,
-    }
-
-
-def _format_number(value: float | None, precision: int) -> str:
-    if value is None:
-        return "--"
-    if precision <= 0:
-        return str(int(round(value)))
-    return f"{value:.{precision}f}"
-
-
-def _format_bool(value: bool | None) -> str:
-    if value is None:
-        return "--"
-    return "YES" if value else "NO"
-
-
-def _temperature_status(value: float | None) -> str:
-    if value is None:
-        return "WAITING"
-    if 35.5 <= value <= 37.5:
-        return STATUS_NORMAL
-    if value < 35.5:
-        return STATUS_RELAX
-    return STATUS_AROUSED
-
-
-def _heart_status(value: float | None) -> str:
-    if value is None:
-        return "WAITING"
-    if value < 55:
-        return STATUS_RELAX
-    if value <= 100:
-        return STATUS_NORMAL
-    return STATUS_AROUSED
-
-
-def _spo2_status(value: float | None, pulse_valid: bool | None) -> str:
-    if pulse_valid is False:
-        return "INVALID"
-    if value is None:
-        return "WAITING"
-    if value >= 95:
-        return STATUS_NORMAL
-    if value >= 90:
-        return STATUS_RELAX
-    return STATUS_AROUSED
-
-
-def _gsr_status(deltas: SensorDeltas) -> str:
-    if deltas.gsr is None:
-        return "WAITING"
-    if deltas.gsr < -100:
-        return STATUS_RELAX
-    if deltas.gsr <= 100:
-        return STATUS_NORMAL
-    return STATUS_AROUSED
+def _ready_mode_for_view(command: str) -> str:
+    if command == BIOMONITOR_VIEW:
+        return ArduinoCommand.STOP.value
+    return f"{command} READY"

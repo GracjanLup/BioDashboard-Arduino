@@ -1,25 +1,3 @@
-/*
-  BioMonitor Dashboard - Arduino Uno firmware
-
-  Hardware:
-    DS18B20 temperature sensor -> D2
-    GSR sensor                 -> A0
-    DFRobot SEN0344 MAX30102   -> I2C, SDA A4, SCL A5
-
-  Supported serial commands:
-    TEMP  - stream temperature only
-    GSR   - stream galvanic skin response only
-    BPM   - stream heart rate / SpO2 only
-    ALL   - stream all enabled sensors
-    STOP  - stop streaming
-
-  Required libraries:
-    OneWire
-    DallasTemperature
-    DFRobot_BloodOxygen_S
-    DFRobot_RTU
-*/
-
 #include <Wire.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -29,8 +7,7 @@ enum Mode {
   MODE_STOP,
   MODE_TEMP,
   MODE_GSR,
-  MODE_BPM,
-  MODE_ALL
+  MODE_BPM
 };
 
 const unsigned long BAUD_RATE = 115200;
@@ -38,7 +15,6 @@ const unsigned long BAUD_RATE = 115200;
 const unsigned long TEMP_GSR_INTERVAL_MS = 1000;
 const unsigned long PULSE_UPDATE_INTERVAL_MS = 4000;
 
-// Pins
 const int DS18B20_PIN = 2;
 const int GSR_PIN = A0;
 
@@ -77,7 +53,7 @@ void setup() {
   setupPulseSensor();
 
   Serial.println("BioMonitor ready");
-  Serial.println("Commands: TEMP, GSR, BPM, ALL, STOP");
+  Serial.println("Commands: TEMP, GSR, BPM, STOP");
 }
 
 
@@ -155,10 +131,6 @@ void setMode(String command) {
     currentMode = MODE_BPM;
     Serial.println("MODE:BPM");
   }
-  else if (command == "ALL") {
-    currentMode = MODE_ALL;
-    Serial.println("MODE:ALL");
-  }
   else if (command == "STOP") {
     currentMode = MODE_STOP;
     Serial.println("MODE:STOP");
@@ -184,11 +156,6 @@ void streamCurrentMode() {
 
   if (currentMode == MODE_BPM) {
     streamPulseOnly();
-    return;
-  }
-
-  if (currentMode == MODE_ALL) {
-    streamAllSensors();
     return;
   }
 }
@@ -217,26 +184,6 @@ void streamPulseOnly() {
 
   Serial.print(",PULSE_VALID:");
   Serial.print(pulseValid ? 1 : 0);
-
-  Serial.print(",PULSE_TEMP:");
-  Serial.println(lastPulseBoardTemp, 2);
-}
-
-void streamAllSensors() {
-  Serial.print("BPM:");
-  Serial.print(pulseValid ? lastBpm : 0);
-
-  Serial.print(",SPO2:");
-  Serial.print(lastSpo2);
-
-  Serial.print(",PULSE_VALID:");
-  Serial.print(pulseValid ? 1 : 0);
-
-  Serial.print(",TEMP:");
-  Serial.print(readTemperatureC(), 2);
-
-  Serial.print(",GSR:");
-  Serial.print(readGsrRaw());
 
   Serial.print(",PULSE_TEMP:");
   Serial.println(lastPulseBoardTemp, 2);

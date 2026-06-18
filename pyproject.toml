@@ -8,8 +8,12 @@ dependencies = [
     "PySide6>=6.7",
     "pyqtgraph>=0.13.7",
     "pyserial>=3.5",
-    "pandas>=2.2",
-    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=2.1",
+    "ruff>=0.15",
 ]
 
 [project.scripts]
@@ -19,3 +23,7 @@ biomonitor-dashboard = "app.main:main"
 line-length = 100
 target-version = "py312"
 
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+check_untyped_defs = true

@@ -1,5 +1,3 @@
-"""Robust parser for Arduino sensor messages."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,11 +6,6 @@ from math import isfinite
 
 @dataclass(frozen=True, slots=True)
 class ParsedMessage:
-    """Parsed values from a serial line.
-
-    Any field can be ``None`` when the Arduino line did not include that sensor.
-    """
-
     temperature: float | None = None
     heart_rate: float | None = None
     spo2: float | None = None
@@ -22,8 +15,6 @@ class ParsedMessage:
 
     @property
     def has_values(self) -> bool:
-        """Return true when at least one supported value was parsed."""
-
         return (
             self.temperature is not None
             or self.heart_rate is not None
@@ -48,8 +39,6 @@ FIELD_MAP = {
 
 
 def has_supported_field(line: str) -> bool:
-    """Return true when a line contains at least one known sensor field name."""
-
     for token in line.strip().split(","):
         key, separator, _value = token.partition(":")
         if separator and key.strip().upper() in FIELD_MAP:
@@ -58,12 +47,6 @@ def has_supported_field(line: str) -> bool:
 
 
 def parse_serial_message(line: str) -> ParsedMessage | None:
-    """Parse Arduino messages such as ``TEMP:36.2`` or combined sample lines.
-
-    Malformed tokens are ignored. The function returns ``None`` when the line has
-    no valid supported fields.
-    """
-
     cleaned = line.strip()
     if not cleaned:
         return None
@@ -103,6 +86,57 @@ def parse_serial_message(line: str) -> ParsedMessage | None:
         gsr=_as_float(values.get("gsr")),
     )
     return parsed if parsed.has_values else None
+
+
+def validation_error_for_line(line: str) -> str | None:
+    tokens = line.strip().split(",")
+    pulse_invalid = _pulse_marked_invalid(tokens)
+
+    for token in tokens:
+        key, separator, value = token.partition(":")
+        if not separator:
+            continue
+
+        field_name = FIELD_MAP.get(key.strip().upper())
+        if field_name is None:
+            continue
+
+        if field_name == "pulse_valid":
+            if _to_bool(value) is None:
+                return "PULSE_VALID must be 0/1 or a valid boolean value."
+            continue
+        if pulse_invalid and field_name in {"heart_rate", "spo2"}:
+            continue
+
+        number = _to_float(value)
+        if number is None:
+            return f"{key.strip().upper()} is not a finite numeric value."
+        if _is_plausible(field_name, number):
+            continue
+
+        if field_name == "temperature":
+            if number <= -100.0:
+                return (
+                    "the DS18B20 returned its disconnected-sensor value. Check the "
+                    "sensor wiring and skin contact, then repeat the measurement."
+                )
+            return "Temperature is outside the supported sensor range (-50 to 150 °C)."
+        if field_name == "heart_rate":
+            return "Heart rate is outside the supported range (20 to 240 BPM)."
+        if field_name == "spo2":
+            return "SpO2 is outside the supported range (0 to 100%)."
+        if field_name == "gsr":
+            return "GSR is outside the Arduino ADC range (0 to 1023)."
+
+    return None
+
+
+def _pulse_marked_invalid(tokens: list[str]) -> bool:
+    for token in tokens:
+        key, separator, value = token.partition(":")
+        if separator and key.strip().upper() == "PULSE_VALID" and _to_bool(value) is False:
+            return True
+    return False
 
 
 def _to_float(value: str) -> float | None:
